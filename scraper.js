@@ -7,70 +7,72 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 async function scrapeMerchant(url, merchantName, query) {
     let browser;
     try {
-        console.log(`[VPS] Lancement du scraping pour ${merchantName}...`);
+        console.log(`[VPS] Scraping ${merchantName} (Mode Ultra-Léger)...`);
 
         browser = await chromium.launch({
             headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-zygote',
+                '--single-process', // Crucial pour économiser la RAM sur Render
+                '--hide-scrollbars'
+            ]
         });
 
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 800 }
-        });
-
-        const page = await context.newPage();
-
-        // Navigation plus rapide
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        const page = await browser.newPage();
         
-        // Pause pour le chargement des prix
-        await page.waitForTimeout(2000);
+        // BLOQUER LES IMAGES ET CSS pour économiser la RAM
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+                route.abort();
+            } else {
+                route.continue();
+            }
+        });
 
-        // Capture du HTML
-        let html = await page.content();
+        // Navigation (on n'attend pas tout, juste le texte)
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        
+        const html = await page.content();
         const $ = cheerio.load(html);
+        
+        // Nettoyage immédiat
+        $('script, style, noscript, iframe, svg, header, footer, nav, ad').remove();
 
-        // Nettoyage
-        $('script, style, noscript, iframe, svg, header, footer, nav').remove();
-
-        // EXTRACTION INTELLIGENTE : On cherche les blocs produits
         let productHTML = "";
-        const productSelectors = ['.s-item', '[data-item-id]', '.product-card', '.result-item'];
-
-        for (const selector of productSelectors) {
-            if ($(selector).length > 2) {
-                $(selector).slice(0, 4).each((i, el) => {
-                    productHTML += $(el).html() + " ---ITEM_SEPARATOR--- ";
+        const selectors = ['.s-item', '[data-item-id]', '.product-card'];
+        for (const s of selectors) {
+            if ($(s).length > 2) {
+                $(s).slice(0, 3).each((i, el) => {
+                    productHTML += $(el).text().replace(/\s+/g, ' ') + "\n"; 
                 });
                 break;
             }
         }
 
-        if (!productHTML) productHTML = $('body').html().substring(0, 15000);
+        if (!productHTML) productHTML = "Aucun produit trouvé dans le texte.";
 
-        // Extraction Groq
         const response = await groq.chat.completions.create({
             messages: [
-                { role: 'system', content: 'You are a data extraction API. Output ONLY valid JSON array.' },
-                { role: 'user', content: `Extract 3 products from this HTML. Return a JSON ARRAY of objects with: title, price (number), currency (string), image (url), link (url).\n\nHTML:\n${productHTML.substring(0, 15000)}` }
+                { role: 'system', content: 'Extract 3 products as JSON array.' },
+                { role: 'user', content: `Extract title, price, currency, image, link from:\n${productHTML.substring(0, 8000)}` }
             ],
             model: 'llama-3.3-70b-versatile',
-            temperature: 0.1,
             response_format: { type: "json_object" }
         });
 
-        const content = response.choices[0].message.content;
-        const parsed = JSON.parse(content);
-        let products = Array.isArray(parsed) ? parsed : (parsed.products || []);
-
+        const parsed = JSON.parse(response.choices[0].message.content);
         await browser.close();
-        return products;
+        return Array.isArray(parsed) ? parsed : (parsed.products || []);
 
     } catch (error) {
         console.error(`[VPS Error] ${merchantName}:`, error.message);
         if (browser) await browser.close();
-        return [{ title: "Error", error: error.message }];
+        return [{ title: "Error", error: "Serveur trop chargé, réessayez dans 10 sec." }];
     }
 }
 

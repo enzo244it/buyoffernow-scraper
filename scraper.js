@@ -21,38 +21,48 @@ async function scrapeMerchant(url, merchantName, query) {
 
         const page = await context.newPage();
 
-        // Navigation (on attend que le réseau soit calme)
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-
-        // On attend un peu pour être sûr que le JS a fini de charger les prix
-        await page.waitForTimeout(3000);
+        // Navigation plus rapide
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        
+        // Pause pour le chargement des prix
+        await page.waitForTimeout(2000);
 
         // Capture du HTML
         let html = await page.content();
-
-        // Nettoyage rapide du HTML pour Groq
         const $ = cheerio.load(html);
-        $('script, style, noscript, iframe, svg, header, footer').remove();
-        let cleanHTML = $('body').html().substring(0, 15000); // 15k caractères max
+
+        // Nettoyage
+        $('script, style, noscript, iframe, svg, header, footer, nav').remove();
+
+        // EXTRACTION INTELLIGENTE : On cherche les blocs produits
+        let productHTML = "";
+        const productSelectors = ['.s-item', '[data-item-id]', '.product-card', '.result-item'];
+
+        for (const selector of productSelectors) {
+            if ($(selector).length > 2) {
+                $(selector).slice(0, 4).each((i, el) => {
+                    productHTML += $(el).html() + " ---ITEM_SEPARATOR--- ";
+                });
+                break;
+            }
+        }
+
+        if (!productHTML) productHTML = $('body').html().substring(0, 15000);
 
         // Extraction Groq
         const response = await groq.chat.completions.create({
             messages: [
-                {
-                    role: 'system',
-                    content: 'Tu es un expert en extraction de données. Extrait exactement 3 produits (titre, prix sans devise, devise, lien, image) sous forme de JSON pur.'
-                },
-                {
-                    role: 'user',
-                    content: `HTML de ${merchantName} pour "${query}":\n\n${cleanHTML}`
-                }
+                { role: 'system', content: 'You are a data extraction API. Output ONLY valid JSON array.' },
+                { role: 'user', content: `Extract 3 products from this HTML. Return a JSON ARRAY of objects with: title, price (number), currency (string), image (url), link (url).\n\nHTML:\n${productHTML.substring(0, 15000)}` }
             ],
             model: 'llama-3.3-70b-versatile',
             temperature: 0.1,
-            max_tokens: 1000
+            response_format: { type: "json_object" }
         });
 
-        let products = JSON.parse(response.choices[0].message.content.trim().replace(/```json|```/g, ''));
+        const content = response.choices[0].message.content;
+        const parsed = JSON.parse(content);
+        let products = Array.isArray(parsed) ? parsed : (parsed.products || []);
 
         await browser.close();
         return products;
@@ -60,7 +70,7 @@ async function scrapeMerchant(url, merchantName, query) {
     } catch (error) {
         console.error(`[VPS Error] ${merchantName}:`, error.message);
         if (browser) await browser.close();
-        return [];
+        return [{ title: "Error", error: error.message }];
     }
 }
 

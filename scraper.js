@@ -7,59 +7,44 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 async function scrapeMerchant(url, merchantName, query) {
     let browser;
     try {
-        console.log(`[VPS] Scraping ${merchantName} (Mode Ultra-Léger)...`);
+        console.log(`[VPS] Scraping ${merchantName}...`);
 
         browser = await chromium.launch({
             headless: true,
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--no-zygote',
-                '--single-process', // Crucial pour économiser la RAM sur Render
-                '--hide-scrollbars'
-            ]
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         });
 
-        const page = await browser.newPage();
-        
-        // BLOQUER LES IMAGES ET CSS pour économiser la RAM
+        const context = await browser.newContext({ userAgent: 'Mozilla/5.0...' });
+        const page = await context.newPage();
+
+        // On bloque JUSTE les images et vidéos (on garde le CSS pour la structure)
         await page.route('**/*', (route) => {
             const type = route.request().resourceType();
-            if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
-                route.abort();
-            } else {
-                route.continue();
-            }
+            if (['image', 'media', 'font'].includes(type)) route.abort();
+            else route.continue();
         });
 
-        // Navigation (on n'attend pas tout, juste le texte)
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
         
-        const html = await page.content();
+        // On récupère tout le texte de la page, c'est plus léger que le HTML
+        const text = await page.evaluate(() => document.body.innerText);
+        const html = await page.content(); // On garde un peu de HTML au cas où
+        
         const $ = cheerio.load(html);
+        let sample = "";
         
-        // Nettoyage immédiat
-        $('script, style, noscript, iframe, svg, header, footer, nav, ad').remove();
-
-        let productHTML = "";
-        const selectors = ['.s-item', '[data-item-id]', '.product-card'];
-        for (const s of selectors) {
-            if ($(s).length > 2) {
-                $(s).slice(0, 3).each((i, el) => {
-                    productHTML += $(el).text().replace(/\s+/g, ' ') + "\n"; 
-                });
-                break;
+        // On cible spécifiquement les liens qui ont l'air d'être des produits
+        $('a').each((i, el) => {
+            const linkText = $(el).text().trim();
+            if (linkText.length > 20) { // Un titre de produit est long
+                sample += linkText + " | URL: " + $(el).attr('href') + "\n";
             }
-        }
-
-        if (!productHTML) productHTML = "Aucun produit trouvé dans le texte.";
+        });
 
         const response = await groq.chat.completions.create({
             messages: [
-                { role: 'system', content: 'Extract 3 products as JSON array.' },
-                { role: 'user', content: `Extract title, price, currency, image, link from:\n${productHTML.substring(0, 8000)}` }
+                { role: 'system', content: 'You are a product extractor. Return JSON array.' },
+                { role: 'user', content: `Extract 3 products (title, price, currency, link, image) from this text search results for "${query}":\n\n${sample.substring(0, 10000)}` }
             ],
             model: 'llama-3.3-70b-versatile',
             response_format: { type: "json_object" }
@@ -67,12 +52,11 @@ async function scrapeMerchant(url, merchantName, query) {
 
         const parsed = JSON.parse(response.choices[0].message.content);
         await browser.close();
-        return Array.isArray(parsed) ? parsed : (parsed.products || []);
+        return parsed.products || parsed;
 
     } catch (error) {
-        console.error(`[VPS Error] ${merchantName}:`, error.message);
         if (browser) await browser.close();
-        return [{ title: "Error", error: "Serveur trop chargé, réessayez dans 10 sec." }];
+        return [{ title: "Error", message: error.message }];
     }
 }
 
